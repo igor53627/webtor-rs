@@ -44,6 +44,10 @@ mod wasm {
             let tx_err = tx.clone();
             let tx_close = tx;
 
+            // Shared state for connection status (Open/Error/Close during handshake)
+            let (open_tx, open_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
+            let open_tx = Rc::new(RefCell::new(Some(open_tx)));
+
             // onmessage
             let on_message = Closure::wrap(Box::new(move |e: MessageEvent| {
                 if let Ok(abuf) = e.data().dyn_into::<ArrayBuffer>() {
@@ -51,7 +55,6 @@ mod wasm {
                     let data = array.to_vec();
                     let _ = tx_msg.unbounded_send(Ok(data));
                 } else if let Ok(txt) = e.data().dyn_into::<js_sys::JsString>() {
-                     // Text data is technically not expected for Tor, but let's handle it as bytes
                     let data = String::from(txt).into_bytes();
                     let _ = tx_msg.unbounded_send(Ok(data));
                 }
@@ -59,48 +62,47 @@ mod wasm {
             socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
             // onerror
+            let open_tx_err = open_tx.clone();
             let on_error = Closure::wrap(Box::new(move |e: ErrorEvent| {
                 let msg = e.message();
+                // If we are still connecting, fail the connection future
+                if let Some(tx) = open_tx_err.borrow_mut().take() {
+                    let _ = tx.send(Err(format!("WebSocket error during connection: {}", msg)));
+                }
                 let _ = tx_err.unbounded_send(Err(io::Error::new(io::ErrorKind::Other, msg)));
             }) as Box<dyn FnMut(ErrorEvent)>);
             socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
 
             // onclose
+            let open_tx_close = open_tx.clone();
             let on_close = Closure::wrap(Box::new(move |e: web_sys::CloseEvent| {
-                // Close event means EOF or error depending on code
+                // If we are still connecting, fail the connection future
+                if let Some(tx) = open_tx_close.borrow_mut().take() {
+                    let _ = tx.send(Err(format!("WebSocket closed during connection: code={}, reason={}", e.code(), e.reason())));
+                }
+
                 if !e.was_clean() {
                      let _ = tx_close.unbounded_send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("Close code: {}", e.code()))));
-                } else {
-                    // EOF
-                    // We just drop the sender, which will cause the receiver to return None eventually
                 }
+                // If clean close, just drop sender (handled by closure capture drop)
             }) as Box<dyn FnMut(web_sys::CloseEvent)>);
             socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
-            // Wait for open
-            let (open_tx, open_rx) = futures::channel::oneshot::channel::<std::result::Result<(), ()>>();
-            let open_tx = Rc::new(RefCell::new(Some(open_tx)));
-            let open_tx_clone = open_tx.clone();
-            
+            // onopen
+            let open_tx_open = open_tx.clone();
             let on_open = Closure::once(move || {
-                if let Some(tx) = open_tx_clone.borrow_mut().take() {
+                if let Some(tx) = open_tx_open.borrow_mut().take() {
                     let _ = tx.send(Ok(()));
                 }
             });
             socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
 
             // Wait for connection or error
-            // We also need to handle error during connection phase
-            // Reuse the mpsc receiver? No, that's for data.
-            // We'll just wait for the oneshot.
-            // But if error happens before open, we need to know.
-            // Implementation detail: If error/close happens before open, we might hang if we don't handle it.
-            // For simplicity in this POC, we assume success or eventual timeout by caller.
-            // Ideally, we'd link the error handler to the open_tx too.
-            
-            open_rx.await
-                .map_err(|_: futures::channel::oneshot::Canceled| TorError::Network("Connection cancelled".to_string()))?
-                .map_err(|_| TorError::Network("Failed to open WebSocket".to_string()))?;
+            match open_rx.await {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => return Err(TorError::Network(e)),
+                Err(_) => return Err(TorError::Network("Connection cancelled or sender dropped".to_string())),
+            }
 
             Ok(Self {
                 socket,

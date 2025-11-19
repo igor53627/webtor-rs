@@ -27,12 +27,25 @@ impl SnowflakeBridge {
     pub async fn connect(&self) -> Result<SnowflakeStream> {
         info!("Connecting to Snowflake bridge at {}", self.websocket_url);
         
-        // TODO: Use connection_timeout when establishing connection
-        let stream = WebSocketStream::connect(&self.websocket_url).await?;
+        use crate::wasm_runtime::WasmRuntime;
+        use tor_rtcompat::SleepProvider;
+        use futures::FutureExt;
+
+        let runtime = WasmRuntime::new();
+        let timeout = runtime.sleep(self._connection_timeout);
+        let connect_fut = WebSocketStream::connect(&self.websocket_url);
         
-        Ok(SnowflakeStream {
-            inner: stream,
-        })
+        futures::select! {
+            res = connect_fut.fuse() => {
+                let stream = res?;
+                Ok(SnowflakeStream {
+                    inner: stream,
+                })
+            }
+            _ = timeout.fuse() => {
+                Err(crate::error::TorError::Network(format!("Snowflake connection timed out after {:?}", self._connection_timeout)))
+            }
+        }
     }
 }
 

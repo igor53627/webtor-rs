@@ -234,13 +234,9 @@ impl TorClient {
              }
         }
         
-        // If no valid identity was set, use dummy identities
-        // This will likely fail the handshake verification if the bridge is real,
-        // but allows the build to proceed for testing or if the user didn't provide a fingerprint.
+        // If no valid identity was set, fail early
         if !identity_set {
-            let dummy_ed: Ed25519Identity = [0u8; 32].into();
-            let dummy_rsa: RsaIdentity = [0u8; 20].into();
-            builder.ed_identity(dummy_ed).rsa_identity(dummy_rsa);
+            return Err(TorError::Configuration("Bridge fingerprint is required for Snowflake connection".to_string()));
         }
             
         let peer = builder.build()
