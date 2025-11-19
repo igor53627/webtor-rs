@@ -12,6 +12,7 @@ use gloo_console::{log as console_log, error as console_error, warn as console_w
 
 /// JavaScript-friendly options for TorClient
 #[wasm_bindgen]
+#[derive(Clone)]
 pub struct TorClientOptions {
     inner: NativeTorClientOptions,
 }
@@ -61,6 +62,7 @@ impl TorClientOptions {
 
 /// JavaScript-friendly TorClient
 #[wasm_bindgen]
+#[derive(Clone)]
 pub struct TorClient {
     inner: Option<Arc<NativeTorClient>>,
 }
@@ -285,6 +287,81 @@ impl TorClient {
             })
         }
     }
+
+    // --- Rust-friendly methods (not exposed to JS, but usable by other Rust crates) ---
+
+    pub async fn create(options: TorClientOptions) -> Result<Self, String> {
+         match NativeTorClient::new(options.inner).await {
+            Ok(client) => Ok(TorClient {
+                inner: Some(Arc::new(client)),
+            }),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub async fn fetch_rust(&self, url: &str) -> Result<JsHttpResponse, String> {
+        let client = self.inner.as_ref().ok_or("TorClient is not initialized")?;
+        match client.fetch(url).await {
+            Ok(response) => {
+                Ok(JsHttpResponse {
+                    status: response.status,
+                    headers: serde_wasm_bindgen::to_value(&response.headers).unwrap(),
+                    body: response.body,
+                    url: response.url.to_string(),
+                })
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub async fn wait_for_circuit_rust(&self) -> Result<(), String> {
+        let client = self.inner.as_ref().ok_or("TorClient is not initialized")?;
+        client.wait_for_circuit().await.map_err(|e| e.to_string())
+    }
+
+    pub async fn close_rust(&mut self) {
+        if let Some(client) = self.inner.take() {
+             // We need to clone the Arc because close takes self/&self but we are taking ownership of the Arc from Option
+             // Actually client.close() takes &self. 
+             // But we removed it from Option, so we own the Arc.
+             // NativeTorClient::close is async.
+             client.close().await;
+        }
+    }
+
+    pub async fn get_circuit_status_string_rust(&self) -> Result<String, String> {
+        let client = self.inner.as_ref().ok_or("TorClient is not initialized")?;
+        Ok(client.get_circuit_status_string().await)
+    }
+
+    pub async fn fetch_one_time_rust(
+        snowflake_url: &str,
+        url: &str,
+        connection_timeout: Option<u64>,
+        circuit_timeout: Option<u64>,
+    ) -> Result<JsHttpResponse, String> {
+         match NativeTorClient::fetch_one_time(
+            snowflake_url,
+            url,
+            connection_timeout,
+            circuit_timeout,
+        ).await {
+            Ok(response) => {
+                Ok(JsHttpResponse {
+                    status: response.status,
+                    headers: serde_wasm_bindgen::to_value(&response.headers).unwrap(),
+                    body: response.body,
+                    url: response.url.to_string(),
+                })
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    
+    pub async fn update_circuit_rust(&self, deadline_ms: u64) -> Result<(), String> {
+        let client = self.inner.as_ref().ok_or("TorClient is not initialized")?;
+        client.update_circuit(Duration::from_millis(deadline_ms)).await.map_err(|e| e.to_string())
+    }
 }
 
 /// JavaScript-friendly HTTP response
@@ -378,8 +455,8 @@ impl JsCircuitStatus {
 }
 
 /// Initialize the WASM module
-#[wasm_bindgen(start)]
-pub fn main() {
+#[wasm_bindgen]
+pub fn init() {
     // Set up panic handler
     std::panic::set_hook(Box::new(console_error_panic_hook::hook));
     
