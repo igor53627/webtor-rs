@@ -4,6 +4,10 @@ use crate::error::{Result, TorError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
+use tor_linkspec::{OwnedChanTarget, OwnedCircTarget, OwnedChanTargetBuilder};
+use tor_llcrypto::pk::{rsa::RsaIdentity, ed25519::Ed25519Identity, curve25519::PublicKey as Curve25519PublicKey};
+use tor_protover::Protocols;
+use std::str::FromStr;
 
 /// Tor relay information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +22,98 @@ pub struct Relay {
     pub consensus_weight: u32,
     pub version: String,
     pub microdescriptor_hash: String,
+    
+    // New fields for keys
+    #[serde(default)]
+    pub ed25519_identity: Option<String>, // Hex encoded
+    #[serde(default)]
+    pub ntor_onion_key: String, // Hex encoded
+}
+
+impl Relay {
+    /// Create a new Relay instance
+    pub fn new(
+        fingerprint: String,
+        nickname: String,
+        address: String,
+        or_port: u16,
+        flags: HashSet<String>,
+        ntor_onion_key: String,
+    ) -> Self {
+        Self {
+            fingerprint,
+            nickname,
+            address,
+            or_port,
+            dir_port: None,
+            flags,
+            bandwidth: 0,
+            consensus_weight: 0,
+            version: String::new(),
+            microdescriptor_hash: String::new(),
+            ed25519_identity: None,
+            ntor_onion_key,
+        }
+    }
+
+    /// Convert to OwnedCircTarget for circuit creation
+    pub fn as_circ_target(&self) -> Result<OwnedCircTarget> {
+        let mut builder = OwnedCircTarget::builder();
+        
+        {
+            let chan_builder = builder.chan_target();
+            
+            // Add addresses
+            if let Ok(ip) = std::net::IpAddr::from_str(&self.address) {
+                chan_builder.addrs(vec![std::net::SocketAddr::new(ip, self.or_port)]);
+            } else {
+                 return Err(TorError::Configuration(format!("Invalid relay address: {}", self.address)));
+            }
+            
+            // RSA Identity
+            if let Ok(bytes) = hex::decode(&self.fingerprint) {
+                 if bytes.len() == 20 {
+                     if let Some(rsa_id) = RsaIdentity::from_bytes(&bytes) {
+                         chan_builder.rsa_identity(rsa_id);
+                     } else {
+                         return Err(TorError::Configuration("Invalid RSA identity".to_string()));
+                     }
+                 } else {
+                     return Err(TorError::Configuration("Invalid RSA identity length".to_string()));
+                 }
+            } else {
+                return Err(TorError::Configuration("Invalid RSA identity hex".to_string()));
+            }
+            
+            // Ed25519 Identity
+            if let Some(ref ed_hex) = self.ed25519_identity {
+                 if let Ok(bytes) = hex::decode(ed_hex) {
+                     if let Some(ed_id) = Ed25519Identity::from_bytes(&bytes) {
+                         chan_builder.ed_identity(ed_id);
+                     }
+                 }
+            }
+        }
+        
+        // ntor key
+        if let Ok(bytes) = hex::decode(&self.ntor_onion_key) {
+             if bytes.len() == 32 {
+                 let mut key_bytes = [0u8; 32];
+                 key_bytes.copy_from_slice(&bytes);
+                 builder.ntor_onion_key(Curve25519PublicKey::from(key_bytes));
+             } else {
+                 return Err(TorError::Configuration("Invalid ntor key length".to_string()));
+             }
+        } else {
+            return Err(TorError::Configuration("Invalid ntor key hex".to_string()));
+        };
+        
+        // Protocols
+        builder.protocols(Protocols::default());
+        
+        builder.build()
+            .map_err(|e| TorError::Internal(format!("Failed to build circ target: {}", e)))
+    }
 }
 
 /// Relay selection criteria
@@ -25,6 +121,7 @@ pub struct Relay {
 pub struct RelayCriteria {
     pub need_flags: HashSet<String>,
     pub exclude_flags: HashSet<String>,
+    pub exclude_fingerprints: HashSet<String>,
     pub min_bandwidth: u64,
     pub max_selection: usize,
 }
@@ -34,6 +131,7 @@ impl Default for RelayCriteria {
         Self {
             need_flags: HashSet::new(),
             exclude_flags: HashSet::new(),
+            exclude_fingerprints: HashSet::new(),
             min_bandwidth: 0,
             max_selection: 10,
         }
@@ -52,6 +150,18 @@ impl RelayCriteria {
     
     pub fn without_flag(mut self, flag: &str) -> Self {
         self.exclude_flags.insert(flag.to_string());
+        self
+    }
+    
+    pub fn without_fingerprint(mut self, fingerprint: &str) -> Self {
+        self.exclude_fingerprints.insert(fingerprint.to_string());
+        self
+    }
+    
+    pub fn without_fingerprints(mut self, fingerprints: Vec<String>) -> Self {
+        for fp in fingerprints {
+            self.exclude_fingerprints.insert(fp);
+        }
         self
     }
     
@@ -80,6 +190,11 @@ impl RelayManager {
     pub fn select_relays(&self, criteria: &RelayCriteria) -> Result<Vec<Relay>> {
         let mut candidates: Vec<&Relay> = self.relays.iter()
             .filter(|relay| {
+                // Check excluded fingerprints
+                if criteria.exclude_fingerprints.contains(&relay.fingerprint) {
+                    return false;
+                }
+
                 // Check required flags
                 for flag in &criteria.need_flags {
                     if !relay.flags.contains(flag) {
@@ -123,15 +238,20 @@ impl RelayManager {
     
     /// Select a single relay randomly from candidates
     pub fn select_relay(&self, criteria: &RelayCriteria) -> Result<Relay> {
+        use rand::seq::SliceRandom;
+        
         let candidates = self.select_relays(criteria)?;
         
         if candidates.is_empty() {
             return Err(TorError::relay_selection("No suitable relays found"));
         }
         
-        // For now, just select the first one (highest consensus weight)
-        // In a real implementation, we'd add some randomization
-        Ok(candidates[0].clone())
+        // Select a random relay from the top candidates to avoid deterministic paths
+        // and ensure load balancing
+        let mut rng = rand::thread_rng();
+        candidates.choose(&mut rng)
+            .cloned()
+            .ok_or_else(|| TorError::relay_selection("Failed to choose random relay"))
     }
     
     /// Get relay by fingerprint
@@ -196,18 +316,14 @@ mod tests {
     use super::*;
     
     fn create_test_relay(fingerprint: &str, flags: Vec<&str>) -> Relay {
-        Relay {
-            fingerprint: fingerprint.to_string(),
-            nickname: format!("test_{}", fingerprint),
-            address: "127.0.0.1".to_string(),
-            or_port: 9001,
-            dir_port: Some(9030),
-            flags: flags.into_iter().map(String::from).collect(),
-            bandwidth: 1000000,
-            consensus_weight: 100,
-            version: "0.4.5.6".to_string(),
-            microdescriptor_hash: "test_hash".to_string(),
-        }
+        Relay::new(
+            fingerprint.to_string(),
+            format!("test_{}", fingerprint),
+            "127.0.0.1".to_string(),
+            9001,
+            flags.into_iter().map(String::from).collect(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        )
     }
     
     #[test]

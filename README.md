@@ -33,6 +33,7 @@ The main Tor client implementation including:
 - **Relay Selection**: Smart selection of guard, middle, and exit relays
 - **HTTP Client**: HTTP/HTTPS requests through Tor circuits with TLS support
 - **Snowflake Integration**: WebSocket-based bridge communication
+- **Arti Integration**: Uses `arti` (the official Rust Tor implementation) for robust channel and circuit management
 - **Error Handling**: Comprehensive error types and recovery mechanisms
 
 ### WASM Bindings (`webtor-wasm/`)
@@ -229,7 +230,7 @@ Expected performance characteristics:
 
 ## Current Limitations
 
-- **Tor Protocol**: Integration with `arti` (official Rust Tor implementation) is well underway. Channel establishment and handshake with Snowflake bridges are implemented. Full circuit construction and stream handling are the next steps.
+- **Tor Protocol**: Uses `arti` (official Rust Tor implementation) for channel establishment and circuit creation. Full circuit construction logic (CREATE_FAST/CREATE2) is implemented.
 - **Relay Discovery**: Consensus fetching and relay selection needs improvement.
 - **Performance**: Initial connection times are longer than native Tor.
 - **Browser Support**: Requires modern browsers with WebAssembly support.
@@ -242,7 +243,7 @@ Expected performance characteristics:
 - [x] Circuit management architecture
 - [x] Demo webpage with basic functionality
 - [x] Arti Integration (Channel Establishment & Handshake)
-- [ ] Complete Tor circuit creation (CREATE_FAST/CREATE2)
+- [x] Complete Tor circuit creation (CREATE_FAST/CREATE2)
 - [ ] Relay consensus fetching
 - [ ] HTTP client through Tor circuits
 

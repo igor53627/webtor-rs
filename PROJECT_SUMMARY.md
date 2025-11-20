@@ -181,7 +181,7 @@ Flexible configuration in `webtor/src/config.rs`:
 - [x] Fix WASM bindings and linking (RLIB + Rust-friendly API)
 - [x] Fix CI build issues (vendored dependencies)
 - [x] Require bridge fingerprint for proper verification
-- [ ] Implement full Tor circuit creation (CREATE_FAST/CREATE2)
+- [x] Implement full Tor circuit creation (CREATE_FAST/CREATE2)
 - [ ] Add consensus fetching from directory authorities
 - [ ] Integrate with real Tor network
 
