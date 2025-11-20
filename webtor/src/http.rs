@@ -149,20 +149,18 @@ impl HttpResponse {
 mod tests {
     use super::*;
     use crate::relay::{Relay, RelayManager, flags};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
     
     fn create_test_relay(fingerprint: &str, flags: Vec<&str>) -> Relay {
-        Relay {
-            fingerprint: fingerprint.to_string(),
-            nickname: format!("test_{}", fingerprint),
-            address: "127.0.0.1".to_string(),
-            or_port: 9001,
-            dir_port: Some(9030),
-            flags: flags.into_iter().map(String::from).collect(),
-            bandwidth: 1000000,
-            consensus_weight: 100,
-            version: "0.4.5.6".to_string(),
-            microdescriptor_hash: "test_hash".to_string(),
-        }
+        Relay::new(
+            fingerprint.to_string(),
+            format!("test_{}", fingerprint),
+            "127.0.0.1".to_string(),
+            9001,
+            flags.into_iter().map(String::from).collect(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        )
     }
     
     #[tokio::test]
@@ -211,7 +209,8 @@ mod tests {
         ];
         
         let relay_manager = RelayManager::new(relays);
-        let circuit_manager = CircuitManager::new(relay_manager);
+        let channel = Arc::new(RwLock::new(None));
+        let circuit_manager = CircuitManager::new(relay_manager, channel);
         let http_client = TorHttpClient::new(circuit_manager);
         
         // This will fail because we don't have WASM WebSocket implementation

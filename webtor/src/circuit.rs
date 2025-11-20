@@ -374,6 +374,7 @@ mod tests {
             format!("test_{}", fingerprint),
             "127.0.0.1".to_string(),
             9001,
+            flags.into_iter().map(String::from).collect(),
             "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         )
     }
