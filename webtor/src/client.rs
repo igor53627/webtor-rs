@@ -96,7 +96,7 @@ impl TorClient {
         
         // Fetch consensus
         self.log("Fetching consensus...", LogType::Info);
-        self.directory_manager.fetch_consensus(channel).await?;
+        self.directory_manager.fetch_and_process_consensus(channel).await?;
         self.log("Consensus fetched successfully", LogType::Success);
         
         Ok(())

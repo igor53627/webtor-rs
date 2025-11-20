@@ -11,6 +11,9 @@ use tor_proto::client::circuit::TimeoutEstimator;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use tor_netdoc::doc::netstatus::MdConsensus;
 use tor_checkable::Timebound;
+use tor_netdoc::doc::microdesc::MicrodescReader;
+use tor_netdoc::AllowAnnotations;
+use std::collections::HashMap;
 
 /// Directory manager for handling network documents
 pub struct DirectoryManager {
@@ -22,8 +25,7 @@ impl DirectoryManager {
         Self { relay_manager }
     }
 
-    /// Fetch consensus from the directory cache (bridge)
-    pub async fn fetch_consensus(&self, channel: Arc<Channel>) -> Result<()> {
+    async fn fetch_consensus_body(&self, channel: Arc<Channel>) -> Result<String> {
         info!("Fetching consensus from bridge...");
 
         // 1. Create 1-hop circuit (tunnel)
@@ -53,14 +55,12 @@ impl DirectoryManager {
             .map_err(|e| TorError::Internal(format!("Failed to create dir circuit: {}", e)))?;
             
         // 2. Open directory stream
-        // Note: We need to wrap tunnel in Arc because begin_dir_stream expects &Arc<Self>
         let tunnel_arc = Arc::new(tunnel);
         let mut stream = tunnel_arc.begin_dir_stream()
             .await
             .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
             
         // 3. Send HTTP GET request for microdescriptor consensus
-        // TODO: Support compression (.z)
         let path = "/tor/status-vote/current/consensus-microdesc";
         let request = format!(
             "GET {} HTTP/1.0\r\n\
@@ -82,34 +82,21 @@ impl DirectoryManager {
             
         info!("Received consensus response: {} bytes", response.len());
         
-        // 5. Process response (skip headers for now)
-        // Simple header skipping
+        // 5. Process response
         let body_start = response.windows(4)
             .position(|w| w == b"\r\n\r\n")
             .map(|i| i + 4)
             .unwrap_or(0);
             
         let body = &response[body_start..];
-        let body_str = String::from_utf8_lossy(body);
-        
-        self.process_consensus(&body_str).await?;
-        
-        Ok(())
+        Ok(String::from_utf8_lossy(body).to_string())
     }
     
-    /// Parse a consensus document and update the relay manager
-    pub async fn process_consensus(&self, consensus_str: &str) -> Result<usize> {
-        info!("Processing consensus document (length: {})", consensus_str.len());
+    pub async fn fetch_and_process_consensus(&self, channel: Arc<Channel>) -> Result<()> {
+        let consensus_body = self.fetch_consensus_body(channel.clone()).await?;
         
-        // Parse the consensus
-        // We assume it's a Microdescriptor consensus
-        let (_, _, unvalidated) = MdConsensus::parse(consensus_str)
+        let (_, _, unvalidated) = MdConsensus::parse(&consensus_body)
             .map_err(|e| TorError::serialization(format!("Failed to parse consensus: {}", e)))?;
-            
-        // Check timeliness (or assume timely for bootstrapping if needed)
-        // For now, we just check against system time.
-        // If the consensus is not valid, we log a warning but proceed if possible
-        // using dangerously_assume_timely() if check fails, for testing/bootstrap.
         
         let consensus = match unvalidated.clone().check_valid_at(&SystemTime::now()) {
             Ok(c) => c,
@@ -118,68 +105,72 @@ impl DirectoryManager {
                 unvalidated.dangerously_assume_timely()
             }
         };
-            
-        // Access the inner consensus object
-        // UnvalidatedConsensus wraps the actual consensus document
+        
         let inner_consensus = &consensus.consensus;
         
-        info!("Parsed consensus with {} relays", inner_consensus.relays().len());
+        let digests: Vec<[u8; 32]> = inner_consensus
+            .relays()
+            .iter()
+            .map(|r| *r.md_digest())
+            .collect();
+
+        info!("Got {} microdescriptor digests", digests.len());
         
+        let microdescs_body = self.fetch_microdescriptors_body(channel, &digests).await?;
+        info!("Fetched microdescriptors body: {} bytes", microdescs_body.len());
+
+        let mut router_statuses = HashMap::new();
+        for router in inner_consensus.relays() {
+            router_statuses.insert(*router.md_digest(), router);
+        }
+
         let mut relays = Vec::new();
-        
-        for router in inner_consensus.relays().iter() {
-            // Extract basic info
-            let nickname = router.nickname().to_string();
-            let fingerprint = hex::encode(router.rsa_identity().as_bytes());
-            
-            // We need at least one address
-            let address = if let Some(addr) = router.addrs().next() {
-                addr.ip().to_string()
-            } else {
-                continue;
+        let reader = MicrodescReader::new(&microdescs_body, &AllowAnnotations::AnnotationsNotAllowed)?;
+        for microdesc in reader {
+            let microdesc = match microdesc {
+                Ok(md) => md.into_microdesc(),
+                Err(e) => {
+                    warn!("Failed to parse microdescriptor: {}", e);
+                    continue;
+                }
             };
             
-            let or_port = router.addrs().next().map(|a| a.port()).unwrap_or(0);
-            
-            // Flags
-            let mut flags = std::collections::HashSet::new();
-            if router.is_flagged_fast() { flags.insert("Fast".to_string()); }
-            if router.is_flagged_stable() { flags.insert("Stable".to_string()); }
-            // Valid/Authority might not be exposed on MdRouterStatus or named differently
-            // if router.is_flagged_valid() { flags.insert("Valid".to_string()); }
-            if router.is_flagged_guard() { flags.insert("Guard".to_string()); }
-            if router.is_flagged_exit() { flags.insert("Exit".to_string()); }
-            if router.is_flagged_bad_exit() { flags.insert("BadExit".to_string()); }
-            // if router.is_flagged_authority() { flags.insert("Authority".to_string()); }
-            if router.is_flagged_hsdir() { flags.insert("HSDir".to_string()); }
-            if router.is_flagged_v2dir() { flags.insert("V2Dir".to_string()); }
-            
-            // We need Ed25519 identity and ntor key for circuit creation
-            // Note: MdConsensus routers might not have all keys directly accessible 
-            // in the same way as full descriptors, but let's try to extract what we can.
-            
-            let ntor_onion_key = hex::encode(router.ntor_onion_key().as_bytes());
+            if let Some(router) = router_statuses.get(microdesc.digest()) {
+                let nickname = router.nickname().to_string();
+                let fingerprint = hex::encode(router.rsa_identity().as_bytes());
+                
+                let address = if let Some(addr) = router.addrs().next() {
+                    addr.ip().to_string()
+                } else {
+                    continue;
+                };
+                
+                let or_port = router.addrs().next().map(|a| a.port()).unwrap_or(0);
+                
+                let mut flags = std::collections::HashSet::new();
+                if router.is_flagged_fast() { flags.insert("Fast".to_string()); }
+                if router.is_flagged_stable() { flags.insert("Stable".to_string()); }
+                if router.is_flagged_guard() { flags.insert("Guard".to_string()); }
+                if router.is_flagged_exit() { flags.insert("Exit".to_string()); }
+                if router.is_flagged_bad_exit() { flags.insert("BadExit".to_string()); }
+                if router.is_flagged_hsdir() { flags.insert("HSDir".to_string()); }
+                if router.is_flagged_v2dir() { flags.insert("V2Dir".to_string()); }
 
-            let mut relay = Relay::new(
-                fingerprint,
-                nickname,
-                address,
-                or_port,
-                flags,
-                ntor_onion_key,
-            );
+                let ntor_onion_key = hex::encode(microdesc.ntor_key().as_bytes());
+                
+                let mut relay = Relay::new(
+                    fingerprint,
+                    nickname,
+                    address,
+                    or_port,
+                    flags,
+                    ntor_onion_key,
+                );
 
-            if let Some(ed_id) = router.ed_identity() {
-                relay.ed25519_identity = Some(hex::encode(ed_id.as_bytes()));
+                relay.ed25519_identity = Some(hex::encode(microdesc.ed25519_id().as_bytes()));
+                
+                relays.push(relay);
             }
-
-            relay.consensus_weight = router.weight().weight() as u32;
-            if let Some(version) = router.version() {
-                relay.version = version.to_string();
-            }
-            relay.microdescriptor_hash = hex::encode(router.md_digest());
-            
-            relays.push(relay);
         }
         
         let count = relays.len();
@@ -190,7 +181,73 @@ impl DirectoryManager {
         }
         
         info!("Updated RelayManager with {} relays", count);
+
+        Ok(())
+    }
+
+    async fn fetch_microdescriptors_body(&self, channel: Arc<Channel>, digests: &[[u8; 32]]) -> Result<String> {
+        info!("Fetching {} microdescriptors...", digests.len());
         
-        Ok(count)
+        // TODO: chunk digests
+        
+        let (pending_tunnel, reactor) = channel.new_tunnel(
+            Arc::new(crate::circuit::SimpleTimeoutEstimator) as Arc<dyn TimeoutEstimator>
+        )
+        .await
+        .map_err(|e| TorError::Internal(format!("Failed to create pending tunnel for dir: {}", e)))?;
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = reactor.run().await {
+                error!("Dir circuit reactor finished with error: {}", e);
+            }
+        });
+        
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::spawn(async move {
+            if let Err(e) = reactor.run().await {
+                error!("Dir circuit reactor finished with error: {}", e);
+            }
+        });
+
+        let params = crate::circuit::make_circ_params()?;
+        let tunnel = pending_tunnel.create_firsthop_fast(params)
+            .await
+            .map_err(|e| TorError::Internal(format!("Failed to create dir circuit: {}", e)))?;
+            
+        let tunnel_arc = Arc::new(tunnel);
+        let mut stream = tunnel_arc.begin_dir_stream()
+            .await
+            .map_err(|e| TorError::Internal(format!("Failed to begin dir stream: {}", e)))?;
+        
+        let digests_str: Vec<String> = digests.iter().map(|d| hex::encode_upper(d)).collect();
+        let path = format!("/tor/micro/d/{}", digests_str.join("-"));
+        
+        let request = format!(
+            "GET {} HTTP/1.0\r\n\
+             Host: directory\r\n\
+             Connection: close\r\n\
+             \r\n",
+            path
+        );
+        
+        stream.write_all(request.as_bytes()).await
+            .map_err(|e| TorError::Network(format!("Failed to write dir request: {}", e)))?;
+        stream.flush().await
+            .map_err(|e| TorError::Network(format!("Failed to flush dir request: {}", e)))?;
+            
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await
+            .map_err(|e| TorError::Network(format!("Failed to read dir response: {}", e)))?;
+            
+        info!("Received microdescriptors response: {} bytes", response.len());
+        
+        let body_start = response.windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|i| i + 4)
+            .unwrap_or(0);
+            
+        let body = &response[body_start..];
+        Ok(String::from_utf8_lossy(body).to_string())
     }
 }
