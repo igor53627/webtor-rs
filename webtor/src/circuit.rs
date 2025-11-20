@@ -5,11 +5,12 @@ use crate::relay::{Relay, RelayManager};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 use tor_proto::{ClientTunnel, CellCount, FlowCtrlParameters};
 use tor_proto::circuit::CircParameters;
 use tor_proto::client::circuit::TimeoutEstimator;
 use tor_proto::channel::Channel;
+use tor_linkspec::HasRelayIds;
 use tor_proto::ccparams::{
     CongestionControlParamsBuilder, Algorithm, FixedWindowParamsBuilder, 
     CongestionWindowParamsBuilder, RoundTripEstimatorParamsBuilder
@@ -183,12 +184,16 @@ impl CircuitManager {
             
         #[cfg(target_arch = "wasm32")]
         wasm_bindgen_futures::spawn_local(async move {
-            let _ = reactor.run().await;
+            if let Err(e) = reactor.run().await {
+                error!("Circuit reactor finished with error: {}", e);
+            }
         });
         
         #[cfg(not(target_arch = "wasm32"))]
         tokio::spawn(async move {
-            let _ = reactor.run().await;
+            if let Err(e) = reactor.run().await {
+                error!("Circuit reactor finished with error: {}", e);
+            }
         });
         
         // First hop (Bridge) - FAST handshake
@@ -198,6 +203,26 @@ impl CircuitManager {
             .map_err(|e| TorError::Internal(format!("Failed to create first hop: {}", e)))?;
             
         info!("First hop created (FAST)");
+
+        // Construct Relay object for the bridge from the channel target
+        // Note: The channel target might not have all relay info (like ntor key for fast handshake),
+        // but we construct a best-effort representation for the circuit info.
+        let channel_target = channel.target();
+        let bridge_fingerprint = channel_target.rsa_identity()
+            .map(|id| hex::encode(id.as_bytes()))
+            .unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
+            
+        // We don't have the real address easily accessible in string format from OwnedChanTarget without some work,
+        // or the ntor key if it wasn't known.
+        // For visual consistency in the circuit list, we create a placeholder if needed.
+        let bridge_relay = Relay::new(
+            bridge_fingerprint,
+            "Bridge".to_string(),
+            "0.0.0.0".to_string(), // Placeholder
+            0,
+            std::collections::HashSet::new(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        );
 
         // Select relays
         let relay_manager = self.relay_manager.read().await;
@@ -231,7 +256,7 @@ impl CircuitManager {
         let mut circuit = Circuit::new(circuit_id.clone(), Some(tunnel));
         
         // Store relays
-        circuit.relays = vec![middle, exit];
+        circuit.relays = vec![bridge_relay, middle, exit];
         circuit.status = CircuitStatus::Ready;
         
         info!("Circuit {} created with {} relays", circuit_id, circuit.relays.len());

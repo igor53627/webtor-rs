@@ -58,9 +58,9 @@ impl TorClient {
         
         // Create initial circuit if requested
         if options.create_circuit_early {
-            info!("Creating initial circuit");
-            if let Err(e) = client.create_initial_circuit().await {
-                error!("Failed to create initial circuit: {}", e);
+            info!("Establishing channel early");
+            if let Err(e) = client.establish_channel().await {
+                error!("Failed to establish channel: {}", e);
                 // Don't fail the client creation, just log the error
             }
         }
@@ -78,7 +78,7 @@ impl TorClient {
         info!("Making one-time fetch request to {} through Snowflake {}", url, snowflake_url);
         
         let options = TorClientOptions::new(snowflake_url.to_string())
-            .with_create_circuit_early(false)
+            .with_create_circuit_early(true) // Ensure channel is established
             .with_circuit_update_interval(None) // No auto-updates for one-time use
             .with_connection_timeout(connection_timeout.unwrap_or(15_000))
             .with_circuit_timeout(circuit_timeout.unwrap_or(90_000));
@@ -192,9 +192,9 @@ impl TorClient {
         info!("Tor client closed");
     }
 
-    /// Create initial circuit (called during construction)
-    async fn create_initial_circuit(&self) -> Result<()> {
-        self.log("Creating initial circuit", LogType::Info);
+    /// Establish the Tor channel (called during construction if requested)
+    async fn establish_channel(&self) -> Result<()> {
+        self.log("Establishing channel", LogType::Info);
         
         let snowflake_url = &self.options.snowflake_url;
         let timeout = Duration::from_millis(self.options.connection_timeout);
